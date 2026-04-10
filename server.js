@@ -1,6 +1,3 @@
-
-
-// server.js
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -9,12 +6,14 @@ import cookieParser from "cookie-parser";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { HfInference } from "@huggingface/inference";
 import { v2 as cloudinary } from "cloudinary";
-import PdfPrinter from "pdfmake";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import crypto from "crypto";
+import os from "os";
+import path from "path";
+
 import fs from "fs";
 import generateDietPdf from './j.js'
 
-import pdfFonts from "pdfmake/build/vfs_fonts.js";
+
 dotenv.config();
 
  const app = express();
@@ -23,7 +22,6 @@ app.use(express.urlencoded({ extended: true, limit: "16kb" }));
 app.use(express.static("public"));
 app.use(cookieParser());
 
-// CORS (handles preflight automatically)
 app.use(
   cors({
     origin: "https://ayurdietfee-4seu.vercel.app",
@@ -32,14 +30,15 @@ app.use(
   })
 );
 
-// Debug request origins only for /api/* routes
 const API_ROUTE_REGEX = /^\/api\/.*/;
 app.use(API_ROUTE_REGEX,(req, res, next) => {
-  console.log(`📡 ${req.method} ${req.originalUrl} from ${req.headers.origin}`);
+  if (process.env.NODE_ENV !== "production") {
+    console.log(`📡 ${req.method} ${req.originalUrl} from ${req.headers.origin}`);
+  }
   next();
 });
 
-// Supabase setup
+
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const supabaseService = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
@@ -54,6 +53,71 @@ cloudinary.config({
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const hf = new HfInference(process.env.HF_API_KEY);
 
+const CACHE_TTL_MS = Number(process.env.DIET_CACHE_TTL_MS || 1000 * 60 * 60 * 12);
+const MAX_CACHE_ENTRIES = Number(process.env.DIET_CACHE_MAX_ENTRIES || 500);
+const dietResultCache = new Map();
+const inFlightDietJobs = new Map();
+
+function normalizePatientData(input = {}) {
+  return {
+    name: String(input.name || "").trim().toLowerCase(),
+    age: String(input.age || "").trim(),
+    height: String(input.height || "").trim(),
+    weight: String(input.weight || "").trim(),
+    BP: String(input.BP || "").trim(),
+    sugar: String(input.sugar || "").trim(),
+    aim: String(input.aim || "").trim().toLowerCase(),
+    exercise: String(input.exercise || "").trim(),
+    waterIntake: String(input.waterIntake || "").trim(),
+    dosha: String(input.dosha || input.doshas || "").trim().toLowerCase(),
+  };
+}
+
+function buildCacheKey(patientData) {
+  const payload = JSON.stringify(patientData);
+  return crypto.createHash("sha256").update(payload).digest("hex");
+}
+
+function trimCacheIfNeeded() {
+  if (dietResultCache.size <= MAX_CACHE_ENTRIES) return;
+  const oldestKey = dietResultCache.keys().next().value;
+  if (oldestKey) {
+    dietResultCache.delete(oldestKey);
+  }
+}
+
+function getCachedDietResult(cacheKey) {
+  const item = dietResultCache.get(cacheKey);
+  if (!item) return null;
+
+  if (Date.now() > item.expiresAt) {
+    dietResultCache.delete(cacheKey);
+    return null;
+  }
+
+  // Keep recently used entries hot.
+  dietResultCache.delete(cacheKey);
+  dietResultCache.set(cacheKey, item);
+  return item.value;
+}
+
+function setCachedDietResult(cacheKey, value) {
+  dietResultCache.set(cacheKey, {
+    expiresAt: Date.now() + CACHE_TTL_MS,
+    value,
+  });
+  trimCacheIfNeeded();
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, item] of dietResultCache.entries()) {
+    if (now > item.expiresAt) {
+      dietResultCache.delete(key);
+    }
+  }
+}, 1000 * 60 * 5).unref();
+
 async function ragQuery(userDetails) {
   const userString = `
 Name: ${userDetails.name}
@@ -65,7 +129,7 @@ Sugar: ${userDetails.sugar}
 Aim: ${userDetails.aim}
 Exercise: ${userDetails.exercise}
 Water Intake: ${userDetails.waterIntake}
-Doshas: ${userDetails.doshas}
+Doshas: ${userDetails.dosha || userDetails.doshas}
 `;
 
   const embeddingResponse = await hf.featureExtraction({
@@ -73,17 +137,13 @@ Doshas: ${userDetails.doshas}
     inputs: userString,
   });
 
-  // if (!Array.isArray(embeddingResponse) || !Array.isArray(embeddingResponse[0]) || embeddingResponse[0].length !== 768) {
-  //   throw new Error("HF embedding did not return a 768-dimensional vector");
-  // }
+ 
 
-  const queryEmbedding = embeddingResponse; // or embeddingResponse[0]
+  const queryEmbedding = embeddingResponse; 
 
-// 2. CRITICAL FIX: Convert array to PostgreSQL vector string format
-// Example: [0.1, 0.2, 0.3] -> "[0.1,0.2,0.3]"
-const vectorString = `[${queryEmbedding.join(',')}]`; // should be 768
 
-  // 2️⃣ Fetch top 5 similar documents
+const vectorString = `[${queryEmbedding.join(',')}]`;
+
   const { data, error } = await supabaseService.rpc("match_documents", {
     query_embedding:vectorString,
     match_count: 5,
@@ -269,49 +329,78 @@ async function getUserId() {
     throw new Error('User not logged in');
   }
   
-  console.log('User ID:', user.id);
-  return user.id;
+  
 }
 // -------------------- Cloudinary upload --------------------
 async function uploadPdfBufferToCloudinary(pdfBuffer) {
-  const tempPath = `./temp_${Date.now()}.pdf`;
-  fs.writeFileSync(tempPath, pdfBuffer);
-  const result = await cloudinary.uploader.upload(tempPath, { resource_type: "raw", format: "pdf" });
-  fs.unlinkSync(tempPath);
-  return result.secure_url;
+  const tempPath = path.join(
+    os.tmpdir(),
+    `diet_${Date.now()}_${crypto.randomUUID()}.pdf`
+  );
+
+  await fs.promises.writeFile(tempPath, pdfBuffer);
+
+  try {
+    const result = await cloudinary.uploader.upload(tempPath, {
+      resource_type: "raw",
+      format: "pdf",
+    });
+    return result.secure_url;
+  } finally {
+    fs.promises.unlink(tempPath).catch(() => {});
+  }
 }
 
 // -------------------- API endpoint --------------------
 app.post("/generate-diet-pdf", async (req, res) => {
+  const startNs = process.hrtime.bigint();
+
+  const sendTimedResponse = (statusCode, payload, cacheStatus = "MISS") => {
+    const elapsedMs = Number(process.hrtime.bigint() - startNs) / 1e6;
+    res.setHeader("X-Cache", cacheStatus);
+    res.setHeader("X-Response-Time-Ms", elapsedMs.toFixed(2));
+    return res.status(statusCode).json(payload);
+  };
+
   try {
-            const { name, age, height, weight, BP, sugar, aim, exercise, waterIntake, dosha } = req.body;
-        const patientData = { name, age, height, weight, BP, sugar, aim, exercise, waterIntake, dosha };
+    const patientData = normalizePatientData(req.body);
+    const cacheKey = buildCacheKey(patientData);
 
-        // 1️⃣ Generate Diet JSON
-        const dietJSON = await ragQuery(patientData);
-// console.log(JSON.parse(dietJSON))
-        const pdfBytes = await generateDietPdf(JSON.parse(dietJSON));
-          // console.log(Buffer.from(pdfBytes))
-             const cloudinary_pdf_url= await uploadPdfBufferToCloudinary( pdfBytes);
-            //  console.log(cloudinary_pdf_url)
-        // const user_id = await getUserId(); // From Supabase Auth
-        //   await supabase.from('patient_diet_pdfs').insert({
-        //     patient_name: 'name',
-        //       doctor_id: user_id,
-        //     dosha: dosha,
-        //             pdf_url: cloudinary_pdf_url
-        //           });
+    const cachedResult = getCachedDietResult(cacheKey);
+    if (cachedResult) {
+      return sendTimedResponse(200, cachedResult, "HIT");
+    }
 
-    // Send PDF to browser for download
-    // res.setHeader("Content-Type", "application/pdf");
-    // res.setHeader("Content-Disposition", 'attachment; filename="AyurvedicDietPlan.pdf"');
-    // res.send(Buffer.from(pdfBytes));
-   res.json({
-            success: true,
-            pdfUrl: cloudinary_pdf_url
-        });} catch (err) {
+    if (inFlightDietJobs.has(cacheKey)) {
+      const inFlightResult = await inFlightDietJobs.get(cacheKey);
+      return sendTimedResponse(200, inFlightResult, "COALESCED");
+    }
+
+    const jobPromise = (async () => {
+      const dietJSON = await ragQuery(patientData);
+      const pdfBytes = await generateDietPdf(JSON.parse(dietJSON));
+      const cloudinaryPdfUrl = await uploadPdfBufferToCloudinary(pdfBytes);
+
+      const payload = {
+        success: true,
+        pdfUrl: cloudinaryPdfUrl,
+      };
+
+      setCachedDietResult(cacheKey, payload);
+      return payload;
+    })();
+
+    inFlightDietJobs.set(cacheKey, jobPromise);
+
+    try {
+      const result = await jobPromise;
+      return sendTimedResponse(200, result, "MISS");
+    } finally {
+      inFlightDietJobs.delete(cacheKey);
+    }
+  } catch (err) {
     console.error(err);
-    res.status(500).json({ success: false, error: err.message });
+    return sendTimedResponse(500, { success: false, error: err.message }, "ERROR");
   }
 });
 // --- OAuth: Supabase login/logout ---

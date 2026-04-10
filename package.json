@@ -2,11 +2,9 @@
   "dependencies": {
     "@fontsource/noto-sans": "^5.2.10",
     "@google/generative-ai": "^0.24.1",
-    "@huggingface/inference": "^4.9.0",
+    "@huggingface/inference": "^4.8.0",
     "@langchain/core": "^0.3.77",
-    "@supabase/supabase-js": "^2.58.0",
-    "@types/cookie-parser": "^1.4.9",
-    "@types/cors": "^2.8.19",
+    "@supabase/supabase-js": "^2.57.4",
     "axios": "^1.12.2",
     "body-parser": "^2.2.0",
     "cloudinary": "^2.7.0",
@@ -24,10 +22,9 @@
     "pdf-parse": "^1.1.1",
     "pdfkit": "^0.17.2",
     "pdfmake": "^0.2.20",
-    "puppeteer": "^24.22.3",
-    "vite": "^7.1.7"
+    "puppeteer": "^24.22.3"
   },
-   "type": "module",
+  "type": "module",
   "devDependencies": {
     "@types/cookie-parser": "^1.4.9",
     "@types/cors": "^2.8.19",
